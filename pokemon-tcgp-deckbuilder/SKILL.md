@@ -1,7 +1,8 @@
------
+---
+name: pokemon-tcgp-deckbuilder
+description: Pokémon TCG Pocket deck building assistant. Use when the user asks to build a deck, improve a deck, counter a matchup, complete a mission, suggest cards, or discuss strategy for Pokémon TCG Pocket (PTCGP). Trigger phrases include "build me a deck", "deck for mission", "counter deck", "what cards should I use", "improve my deck", "PTCGP deck", "Pokemon Pocket deck".
+---
 
-## name: pokemon-tcgp-deckbuilder
-description: Pokémon TCG Pocket deck building assistant. Use when the user asks to build a deck, improve a deck, counter a matchup, complete a mission, suggest cards, or discuss strategy for Pokémon TCG Pocket (PTCGP). Trigger phrases include “build me a deck”, “deck for mission”, “counter deck”, “what cards should I use”, “improve my deck”, “PTCGP deck”, “Pokemon Pocket deck”.
 
 # Pokémon TCG Pocket Deckbuilder
 
