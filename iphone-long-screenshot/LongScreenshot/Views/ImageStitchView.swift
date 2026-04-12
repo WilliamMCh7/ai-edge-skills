@@ -1,17 +1,27 @@
 import SwiftUI
 import PhotosUI
 
+struct StitchableImage: Identifiable, Equatable {
+    let id = UUID()
+    let image: UIImage
+
+    static func == (lhs: StitchableImage, rhs: StitchableImage) -> Bool {
+        lhs.id == rhs.id
+    }
+}
+
 struct ImageStitchView: View {
     @StateObject private var stitcher = ImageStitcherService()
     @State private var selectedItems: [PhotosPickerItem] = []
-    @State private var selectedImages: [UIImage] = []
+    @State private var images: [StitchableImage] = []
     @State private var showResult = false
+    @State private var draggingItem: StitchableImage?
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 16) {
                 // Instructions
-                if selectedImages.isEmpty {
+                if images.isEmpty {
                     Spacer()
                     VStack(spacing: 12) {
                         Image(systemName: "rectangle.portrait.on.rectangle.portrait.angled")
@@ -23,39 +33,85 @@ struct ImageStitchView: View {
                     }
                     Spacer()
                 } else {
-                    // Selected images preview
+                    // Reorderable images
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 12) {
-                            ForEach(Array(selectedImages.enumerated()), id: \.offset) { index, image in
+                            ForEach(Array(images.enumerated()), id: \.element.id) { index, item in
                                 VStack(spacing: 4) {
-                                    Image(uiImage: image)
+                                    Image(uiImage: item.image)
                                         .resizable()
                                         .scaledToFit()
                                         .frame(height: 200)
                                         .clipShape(RoundedRectangle(cornerRadius: 8))
                                         .shadow(radius: 2)
+                                        .overlay(RoundedRectangle(cornerRadius: 8)
+                                            .stroke(draggingItem?.id == item.id ? Color.blue : Color.clear, lineWidth: 2))
+                                        .opacity(draggingItem?.id == item.id ? 0.5 : 1.0)
+                                        .draggable(item.id.uuidString) {
+                                            Image(uiImage: item.image)
+                                                .resizable()
+                                                .scaledToFit()
+                                                .frame(height: 100)
+                                                .clipShape(RoundedRectangle(cornerRadius: 6))
+                                                .shadow(radius: 4)
+                                                .onAppear { draggingItem = item }
+                                        }
+                                        .dropDestination(for: String.self) { droppedIDs, _ in
+                                            guard let droppedID = droppedIDs.first,
+                                                  let fromIndex = images.firstIndex(where: { $0.id.uuidString == droppedID }),
+                                                  let toIndex = images.firstIndex(where: { $0.id == item.id }),
+                                                  fromIndex != toIndex else {
+                                                return false
+                                            }
+                                            withAnimation(.easeInOut(duration: 0.3)) {
+                                                let moved = images.remove(at: fromIndex)
+                                                images.insert(moved, at: toIndex)
+                                            }
+                                            draggingItem = nil
+                                            return true
+                                        }
 
-                                    Text("\(index + 1)")
-                                        .font(.caption2)
-                                        .fontWeight(.medium)
-                                        .foregroundStyle(.secondary)
+                                    // Number badge + move buttons
+                                    HStack(spacing: 8) {
+                                        Button {
+                                            guard index > 0 else { return }
+                                            withAnimation(.easeInOut(duration: 0.25)) {
+                                                images.swapAt(index, index - 1)
+                                            }
+                                        } label: {
+                                            Image(systemName: "chevron.left")
+                                                .font(.caption2)
+                                        }
+                                        .disabled(index == 0)
+
+                                        Text("\(index + 1)")
+                                            .font(.caption2)
+                                            .fontWeight(.bold)
+                                            .monospacedDigit()
+                                            .frame(minWidth: 16)
+
+                                        Button {
+                                            guard index < images.count - 1 else { return }
+                                            withAnimation(.easeInOut(duration: 0.25)) {
+                                                images.swapAt(index, index + 1)
+                                            }
+                                        } label: {
+                                            Image(systemName: "chevron.right")
+                                                .font(.caption2)
+                                        }
+                                        .disabled(index == images.count - 1)
+                                    }
+                                    .foregroundStyle(.secondary)
                                 }
                             }
                         }
                         .padding(.horizontal)
                     }
-                    .frame(height: 230)
+                    .frame(height: 240)
 
-                    Text("\(selectedImages.count) imagenes seleccionadas")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-
-                    // Reorder hint
-                    Text("Las imagenes se uniran en el orden mostrado (izquierda a derecha)")
+                    Text("\(images.count) imagenes · Arrastra o usa las flechas para reordenar")
                         .font(.caption)
-                        .foregroundStyle(.tertiary)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal)
+                        .foregroundStyle(.secondary)
 
                     Spacer()
                 }
@@ -75,11 +131,11 @@ struct ImageStitchView: View {
                     PhotosPicker(
                         selection: $selectedItems,
                         maxSelectionCount: 20,
-                        matching: .screenshots,
+                        matching: .any(of: [.screenshots, .images]),
                         photoLibrary: .shared()
                     ) {
                         Label(
-                            selectedImages.isEmpty ? "Seleccionar Capturas" : "Cambiar Seleccion",
+                            images.isEmpty ? "Seleccionar Capturas" : "Cambiar Seleccion",
                             systemImage: "photo.on.rectangle.angled"
                         )
                         .frame(maxWidth: .infinity)
@@ -87,10 +143,10 @@ struct ImageStitchView: View {
                     .buttonStyle(.bordered)
                     .controlSize(.large)
 
-                    if !selectedImages.isEmpty {
+                    if !images.isEmpty {
                         Button {
                             Task {
-                                await stitcher.stitchImages(selectedImages)
+                                await stitcher.stitchImages(images.map(\.image))
                                 if stitcher.resultImage != nil {
                                     showResult = true
                                 }
@@ -101,7 +157,7 @@ struct ImageStitchView: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.large)
-                        .disabled(selectedImages.count < 2 || stitcher.isProcessing)
+                        .disabled(images.count < 2 || stitcher.isProcessing)
                     }
                 }
                 .padding(.horizontal)
@@ -110,10 +166,10 @@ struct ImageStitchView: View {
             .navigationTitle("Unir Capturas")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                if !selectedImages.isEmpty {
+                if !images.isEmpty {
                     ToolbarItem(placement: .topBarTrailing) {
                         Button("Limpiar") {
-                            selectedImages.removeAll()
+                            images.removeAll()
                             selectedItems.removeAll()
                         }
                     }
@@ -133,15 +189,15 @@ struct ImageStitchView: View {
     }
 
     private func loadImages(from items: [PhotosPickerItem]) async {
-        var images: [UIImage] = []
+        var loaded: [StitchableImage] = []
         for item in items {
             if let data = try? await item.loadTransferable(type: Data.self),
                let image = UIImage(data: data) {
-                images.append(image)
+                loaded.append(StitchableImage(image: image))
             }
         }
         await MainActor.run {
-            selectedImages = images
+            images = loaded
         }
     }
 }
