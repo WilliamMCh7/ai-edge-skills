@@ -1,0 +1,175 @@
+name: iOS CI
+
+on:
+  push:
+    paths:
+      - 'iphone-long-screenshot/**'
+      - '.github/workflows/ios-ci.yml'
+  pull_request:
+    paths:
+      - 'iphone-long-screenshot/**'
+      - '.github/workflows/ios-ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ios-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build and test (iPhone simulator)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: iphone-long-screenshot
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Select the newest Xcode
+        run: |
+          XCODE_APP=$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -1)
+          echo "Using $XCODE_APP"
+          sudo xcode-select -s "$XCODE_APP"
+          xcodebuild -version
+          xcrun simctl list runtimes
+
+      - name: Pick an iPhone simulator
+        run: |
+          xcrun simctl list devices available -j > "$RUNNER_TEMP/devices.json"
+          python3 - "$RUNNER_TEMP/devices.json" >> "$GITHUB_ENV" <<'PY'
+          import json, re, sys
+
+          devices_by_runtime = json.load(open(sys.argv[1]))["devices"]
+          best = None
+          for runtime, devices in devices_by_runtime.items():
+              match = re.search(r"\.iOS-(\d+)-(\d+)(?:-(\d+))?$", runtime)
+              if not match:
+                  continue
+              version = tuple(int(part or 0) for part in match.groups())
+              for device in devices:
+                  if not device.get("isAvailable", True):
+                      continue
+                  name = device.get("name", "")
+                  named = re.fullmatch(r"iPhone (\d+)( Pro)?", name)
+                  if named:
+                      rank = (2 if named.group(2) else 1, int(named.group(1)))
+                  elif name.startswith("iPhone"):
+                      rank = (0, 0)
+                  else:
+                      continue
+                  key = (version, rank)
+                  if best is None or key > best[0]:
+                      best = (key, device["udid"], name, ".".join(map(str, version)))
+          if best is None:
+              sys.exit("No hay ningún simulador de iPhone disponible")
+          _, udid, name, version = best
+          print(f"Simulador elegido: {name} (iOS {version}) {udid}", file=sys.stderr)
+          print(f"SIM_ID={udid}")
+          print(f"SIM_NAME={name} (iOS {version})")
+          PY
+
+      - name: Boot the simulator
+        run: |
+          echo "Booting $SIM_NAME ($SIM_ID)"
+          xcrun simctl boot "$SIM_ID" || true
+          xcrun simctl bootstatus "$SIM_ID" -b
+          xcrun simctl status_bar "$SIM_ID" override \
+            --time "9:41" --batteryState charged --batteryLevel 100 \
+            --cellularBars 4 --wifiBars 3 || true
+
+      - name: Build and test
+        env:
+          TEST_RUNNER_SCREENSHOT_DIR: ${{ runner.temp }}/screens
+        run: |
+          mkdir -p "$RUNNER_TEMP/screens"
+          status=0
+          xcodebuild test \
+            -project LongScreenshot.xcodeproj \
+            -scheme LongScreenshot \
+            -destination "id=$SIM_ID" \
+            -resultBundlePath "$RUNNER_TEMP/TestResults.xcresult" \
+            CODE_SIGNING_ALLOWED=NO \
+            > "$RUNNER_TEMP/xcodebuild.log" 2>&1 || status=$?
+          echo "xcodebuild terminó con estado $status"
+          echo "----- Resumen del log (errores, avisos de Swift y tests) -----"
+          grep -E "error:|warning: .*\.swift|Test Case .*(passed|failed)|Executed|\*\* (BUILD|TEST)|XCTAssert|failed" \
+            "$RUNNER_TEMP/xcodebuild.log" | tail -n 400 || true
+          exit $status
+
+      - name: Recover screenshots from the result bundle
+        if: always()
+        run: |
+          shopt -s nullglob
+          pngs=("$RUNNER_TEMP"/screens/*.png)
+          if [ ${#pngs[@]} -gt 0 ] || [ ! -d "$RUNNER_TEMP/TestResults.xcresult" ]; then
+            exit 0
+          fi
+          echo "No screenshots were written directly; exporting the attachments from the xcresult."
+          mkdir -p "$RUNNER_TEMP/attachments" "$RUNNER_TEMP/screens"
+          xcrun xcresulttool export attachments \
+            --path "$RUNNER_TEMP/TestResults.xcresult" \
+            --output-path "$RUNNER_TEMP/attachments" || exit 0
+          python3 - "$RUNNER_TEMP/attachments" "$RUNNER_TEMP/screens" <<'PY' || true
+          import json, os, re, shutil, sys
+
+          src, dst = sys.argv[1], sys.argv[2]
+          manifest = json.load(open(os.path.join(src, "manifest.json")))
+          for test in manifest:
+              for attachment in test.get("attachments", []):
+                  exported = attachment.get("exportedFileName", "")
+                  human = attachment.get("suggestedHumanReadableName", exported)
+                  if not exported.lower().endswith(".png"):
+                      continue
+                  match = re.match(r"(\d\d-[a-z0-9-]+)", human)
+                  name = match.group(1) if match else os.path.splitext(human)[0]
+                  shutil.copy(os.path.join(src, exported), os.path.join(dst, name + ".png"))
+                  print("Recovered", name)
+          PY
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: ${{ runner.temp }}/screens
+          if-no-files-found: ignore
+
+      - name: Zip the result bundle
+        if: always()
+        run: |
+          if [ -d "$RUNNER_TEMP/TestResults.xcresult" ]; then
+            ditto -c -k --keepParent "$RUNNER_TEMP/TestResults.xcresult" "$RUNNER_TEMP/TestResults.xcresult.zip"
+          fi
+
+      - name: Upload the result bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TestResults.xcresult
+          path: ${{ runner.temp }}/TestResults.xcresult.zip
+          if-no-files-found: ignore
+
+      - name: Upload the xcodebuild log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
+
+      - name: Print screenshots in the log (base64 JPEG)
+        if: always()
+        run: |
+          shopt -s nullglob
+          mkdir -p "$RUNNER_TEMP/screens-small"
+          for f in "$RUNNER_TEMP"/screens/*.png; do
+            name=$(basename "$f" .png)
+            out="$RUNNER_TEMP/screens-small/$name.jpg"
+            sips -Z 640 -s format jpeg -s formatOptions 55 "$f" --out "$out" > /dev/null || continue
+            echo "=====BEGIN SCREENSHOT $name====="
+            openssl base64 -in "$out"
+            echo "=====END SCREENSHOT====="
+          done

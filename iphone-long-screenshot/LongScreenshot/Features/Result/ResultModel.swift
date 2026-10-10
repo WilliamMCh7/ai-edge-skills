@@ -29,6 +29,8 @@ final class ResultModel: Identifiable, Hashable {
 
     @ObservationIgnored private var renderTask: Task<Void, Never>?
     @ObservationIgnored private var cachedPNG: (image: CGImage, url: URL)?
+    /// Bumped every time `image` is replaced, so each version is written to its own file.
+    @ObservationIgnored private var imageVersion = 0
     @ObservationIgnored private let createdAt = Date()
 
     init(stitched image: CGImage, plan: StitchPlan, sources: [SourceImage]) {
@@ -85,6 +87,7 @@ final class ResultModel: Identifiable, Hashable {
             guard let self, !Task.isCancelled else { return }
             if let rendered {
                 self.image = rendered
+                self.imageVersion += 1
                 self.cachedPNG = nil
             }
             self.isRendering = false
@@ -92,15 +95,22 @@ final class ResultModel: Identifiable, Hashable {
     }
 
     /// PNG of the current image written to a temporary file (cached until the image changes).
+    /// Every image version gets its own file name: the detached encode is not cancelled with the
+    /// caller, so an older encode that finishes late must not overwrite the newer file.
     func pngFileURL() async throws -> URL {
         if let cachedPNG, cachedPNG.image === image { return cachedPNG.url }
+        try Task.checkCancellation()
         let image = self.image
-        let name = fileBaseName + ".png"
+        let version = imageVersion
+        let name = version == 0 ? "\(fileBaseName).png" : "\(fileBaseName) (\(version + 1)).png"
         let url = try await Task.detached(priority: .userInitiated) {
             let data = try ImageExporter.pngData(from: image)
             return try ImageExporter.writeTemporaryFile(data, fileName: name)
         }.value
-        cachedPNG = (image, url)
+        // Never cache the file of an image that was replaced while it was being encoded.
+        if image === self.image {
+            cachedPNG = (image, url)
+        }
         return url
     }
 
@@ -119,10 +129,12 @@ final class ResultModel: Identifiable, Hashable {
         try await PhotoLibrarySaver.savePNG(data)
     }
 
+    /// Unique per result (date + short id), so two results created in the same second never
+    /// share a temporary file.
     private var fileBaseName: String {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH.mm.ss"
-        return "Captura larga \(formatter.string(from: createdAt))"
+        return "Captura larga \(formatter.string(from: createdAt)) \(id.uuidString.prefix(4))"
     }
 
     nonisolated static func == (lhs: ResultModel, rhs: ResultModel) -> Bool { lhs.id == rhs.id }
