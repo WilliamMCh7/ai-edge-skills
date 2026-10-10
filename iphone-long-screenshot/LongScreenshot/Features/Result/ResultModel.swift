@@ -28,6 +28,8 @@ final class ResultModel: Identifiable, Hashable {
     private(set) var isRendering = false
 
     @ObservationIgnored private var renderTask: Task<Void, Never>?
+    /// The plan that produced the current `image`; restored when re-rendering an edit fails.
+    @ObservationIgnored private var renderedPlan: StitchPlan? = nil
     @ObservationIgnored private var cachedPNG: (image: CGImage, url: URL)?
     /// Bumped every time `image` is replaced, so each version is written to its own file.
     @ObservationIgnored private var imageVersion = 0
@@ -37,6 +39,7 @@ final class ResultModel: Identifiable, Hashable {
         self.kind = .stitched
         self.image = image
         self.plan = plan
+        self.renderedPlan = plan
         self.sources = sources
     }
 
@@ -87,8 +90,13 @@ final class ResultModel: Identifiable, Hashable {
             guard let self, !Task.isCancelled else { return }
             if let rendered {
                 self.image = rendered
+                self.renderedPlan = newPlan
                 self.imageVersion += 1
                 self.cachedPNG = nil
+            } else {
+                // Keep `plan` describing the pixels on screen (markers, toggles, seam editor) and
+                // allow retrying the same edit.
+                self.plan = self.renderedPlan
             }
             self.isRendering = false
         }
