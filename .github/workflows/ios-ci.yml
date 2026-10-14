@@ -15,6 +15,10 @@ concurrency:
   group: ios-ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  checks: write
+
 jobs:
   build-and-test:
     name: Build and test (iPhone simulator)
@@ -172,4 +176,68 @@ jobs:
             echo "=====BEGIN SCREENSHOT $name====="
             openssl base64 -in "$out"
             echo "=====END SCREENSHOT====="
+          done
+
+      - name: Publish test summary as annotations
+        if: always()
+        run: |
+          log="$RUNNER_TEMP/xcodebuild.log"
+          [ -f "$log" ] || exit 0
+          python3 - "$log" <<'PY'
+          import re, sys
+
+          text = open(sys.argv[1], errors="replace").read()
+          cases = re.findall(r"Test [Cc]ase '([^']+)' (passed|failed|skipped)[^(]*\((\d+\.\d+) seconds\)", text)
+          counts = {"passed": 0, "failed": 0, "skipped": 0}
+          for _, outcome, _ in cases:
+              counts[outcome] += 1
+          print(f"::notice title=Resumen de tests::{counts['passed']} pasados, "
+                f"{counts['failed']} fallidos, {counts['skipped']} omitidos ({len(cases)} en total)")
+          for name, outcome, _ in [c for c in cases if c[1] != "passed"][:20]:
+              print(f"::notice title=Test {outcome}::{name}")
+          slowest = sorted(cases, key=lambda c: -float(c[2]))[:6]
+          print("::notice title=Tests más lentos::" + "; ".join(f"{n} {t}s" for n, _, t in slowest))
+          for line in re.findall(r"^.*(?:error|XCTAssert\w*) failed.*$|^.*: error: .*$", text, re.M)[:15]:
+              print(f"::notice title=Error::{line.strip()[:900]}")
+          PY
+
+      - name: Publish screenshots as check runs
+        if: always() && github.event_name == 'push' && startsWith(github.ref_name, 'claude/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          shopt -s nullglob
+          for f in "$RUNNER_TEMP"/screens/*.png; do
+            name=$(basename "$f" .png)
+            python3 - "$f" "$name" "$RUNNER_TEMP/payload.json" <<'PY' || continue
+          import base64, json, os, subprocess, sys
+
+          src, name, out = sys.argv[1:4]
+          tmp = os.path.join(os.environ["RUNNER_TEMP"], "check-shot.jpg")
+          encoded = None
+          for size, quality in [(1100, 50), (960, 45), (840, 42), (720, 40), (600, 38), (480, 35)]:
+              subprocess.run(["sips", "-Z", str(size), "-s", "format", "jpeg", "-s", "formatOptions",
+                              str(quality), src, "--out", tmp], check=True, capture_output=True)
+              encoded = base64.b64encode(open(tmp, "rb").read()).decode()
+              if len(encoded) <= 64000:
+                  break
+          json.dump({
+              "name": f"Captura del simulador · {name}",
+              "head_sha": os.environ["SHA"],
+              "status": "completed",
+              "conclusion": "neutral",
+              "output": {
+                  "title": f"Captura del simulador: {name}",
+                  "summary": "Pantalla tomada por los tests de interfaz. El texto contiene la imagen JPEG en base64.",
+                  "text": encoded[:65000],
+              },
+          }, open(out, "w"))
+          PY
+            curl -sS -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/check-runs" \
+              --data @"$RUNNER_TEMP/payload.json" -o /dev/null -w "$name: HTTP %{http_code}\n" || true
           done
