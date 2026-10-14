@@ -1,0 +1,243 @@
+name: iOS CI
+
+on:
+  push:
+    paths:
+      - 'iphone-long-screenshot/**'
+      - '.github/workflows/ios-ci.yml'
+  pull_request:
+    paths:
+      - 'iphone-long-screenshot/**'
+      - '.github/workflows/ios-ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ios-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  build-and-test:
+    name: Build and test (iPhone simulator)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: iphone-long-screenshot
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Select the newest Xcode
+        run: |
+          XCODE_APP=$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -1)
+          echo "Using $XCODE_APP"
+          sudo xcode-select -s "$XCODE_APP"
+          xcodebuild -version
+          xcrun simctl list runtimes
+
+      - name: Pick an iPhone simulator
+        run: |
+          xcrun simctl list devices available -j > "$RUNNER_TEMP/devices.json"
+          python3 - "$RUNNER_TEMP/devices.json" >> "$GITHUB_ENV" <<'PY'
+          import json, re, sys
+
+          devices_by_runtime = json.load(open(sys.argv[1]))["devices"]
+          best = None
+          for runtime, devices in devices_by_runtime.items():
+              match = re.search(r"\.iOS-(\d+)-(\d+)(?:-(\d+))?$", runtime)
+              if not match:
+                  continue
+              version = tuple(int(part or 0) for part in match.groups())
+              for device in devices:
+                  if not device.get("isAvailable", True):
+                      continue
+                  name = device.get("name", "")
+                  named = re.fullmatch(r"iPhone (\d+)( Pro)?", name)
+                  if named:
+                      rank = (2 if named.group(2) else 1, int(named.group(1)))
+                  elif name.startswith("iPhone"):
+                      rank = (0, 0)
+                  else:
+                      continue
+                  key = (version, rank)
+                  if best is None or key > best[0]:
+                      best = (key, device["udid"], name, ".".join(map(str, version)))
+          if best is None:
+              sys.exit("No hay ningún simulador de iPhone disponible")
+          _, udid, name, version = best
+          print(f"Simulador elegido: {name} (iOS {version}) {udid}", file=sys.stderr)
+          print(f"SIM_ID={udid}")
+          print(f"SIM_NAME={name} (iOS {version})")
+          PY
+
+      - name: Boot the simulator
+        run: |
+          echo "Booting $SIM_NAME ($SIM_ID)"
+          xcrun simctl boot "$SIM_ID" || true
+          xcrun simctl bootstatus "$SIM_ID" -b
+          xcrun simctl status_bar "$SIM_ID" override \
+            --time "9:41" --batteryState charged --batteryLevel 100 \
+            --cellularBars 4 --wifiBars 3 || true
+
+      - name: Build and test
+        env:
+          TEST_RUNNER_SCREENSHOT_DIR: ${{ runner.temp }}/screens
+        run: |
+          mkdir -p "$RUNNER_TEMP/screens"
+          status=0
+          xcodebuild test \
+            -project LongScreenshot.xcodeproj \
+            -scheme LongScreenshot \
+            -destination "id=$SIM_ID" \
+            -resultBundlePath "$RUNNER_TEMP/TestResults.xcresult" \
+            CODE_SIGNING_ALLOWED=NO \
+            > "$RUNNER_TEMP/xcodebuild.log" 2>&1 || status=$?
+          echo "xcodebuild terminó con estado $status"
+          echo "----- Resumen del log (errores, avisos de Swift y tests) -----"
+          grep -E "error:|warning: .*\.swift|Test Case .*(passed|failed)|Executed|\*\* (BUILD|TEST)|XCTAssert|failed" \
+            "$RUNNER_TEMP/xcodebuild.log" | tail -n 400 || true
+          exit $status
+
+      - name: Recover screenshots from the result bundle
+        if: always()
+        run: |
+          shopt -s nullglob
+          pngs=("$RUNNER_TEMP"/screens/*.png)
+          if [ ${#pngs[@]} -gt 0 ] || [ ! -d "$RUNNER_TEMP/TestResults.xcresult" ]; then
+            exit 0
+          fi
+          echo "No screenshots were written directly; exporting the attachments from the xcresult."
+          mkdir -p "$RUNNER_TEMP/attachments" "$RUNNER_TEMP/screens"
+          xcrun xcresulttool export attachments \
+            --path "$RUNNER_TEMP/TestResults.xcresult" \
+            --output-path "$RUNNER_TEMP/attachments" || exit 0
+          python3 - "$RUNNER_TEMP/attachments" "$RUNNER_TEMP/screens" <<'PY' || true
+          import json, os, re, shutil, sys
+
+          src, dst = sys.argv[1], sys.argv[2]
+          manifest = json.load(open(os.path.join(src, "manifest.json")))
+          for test in manifest:
+              for attachment in test.get("attachments", []):
+                  exported = attachment.get("exportedFileName", "")
+                  human = attachment.get("suggestedHumanReadableName", exported)
+                  if not exported.lower().endswith(".png"):
+                      continue
+                  match = re.match(r"(\d\d-[a-z0-9-]+)", human)
+                  name = match.group(1) if match else os.path.splitext(human)[0]
+                  shutil.copy(os.path.join(src, exported), os.path.join(dst, name + ".png"))
+                  print("Recovered", name)
+          PY
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: ${{ runner.temp }}/screens
+          if-no-files-found: ignore
+
+      - name: Zip the result bundle
+        if: always()
+        run: |
+          if [ -d "$RUNNER_TEMP/TestResults.xcresult" ]; then
+            ditto -c -k --keepParent "$RUNNER_TEMP/TestResults.xcresult" "$RUNNER_TEMP/TestResults.xcresult.zip"
+          fi
+
+      - name: Upload the result bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TestResults.xcresult
+          path: ${{ runner.temp }}/TestResults.xcresult.zip
+          if-no-files-found: ignore
+
+      - name: Upload the xcodebuild log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
+
+      - name: Print screenshots in the log (base64 JPEG)
+        if: always()
+        run: |
+          shopt -s nullglob
+          mkdir -p "$RUNNER_TEMP/screens-small"
+          for f in "$RUNNER_TEMP"/screens/*.png; do
+            name=$(basename "$f" .png)
+            out="$RUNNER_TEMP/screens-small/$name.jpg"
+            sips -Z 640 -s format jpeg -s formatOptions 55 "$f" --out "$out" > /dev/null || continue
+            echo "=====BEGIN SCREENSHOT $name====="
+            openssl base64 -in "$out"
+            echo "=====END SCREENSHOT====="
+          done
+
+      - name: Publish test summary as annotations
+        if: always()
+        run: |
+          log="$RUNNER_TEMP/xcodebuild.log"
+          [ -f "$log" ] || exit 0
+          python3 - "$log" <<'PY'
+          import re, sys
+
+          text = open(sys.argv[1], errors="replace").read()
+          cases = re.findall(r"Test [Cc]ase '([^']+)' (passed|failed|skipped)[^(]*\((\d+\.\d+) seconds\)", text)
+          counts = {"passed": 0, "failed": 0, "skipped": 0}
+          for _, outcome, _ in cases:
+              counts[outcome] += 1
+          print(f"::notice title=Resumen de tests::{counts['passed']} pasados, "
+                f"{counts['failed']} fallidos, {counts['skipped']} omitidos ({len(cases)} en total)")
+          for name, outcome, _ in [c for c in cases if c[1] != "passed"][:20]:
+              print(f"::notice title=Test {outcome}::{name}")
+          slowest = sorted(cases, key=lambda c: -float(c[2]))[:6]
+          print("::notice title=Tests más lentos::" + "; ".join(f"{n} {t}s" for n, _, t in slowest))
+          for line in re.findall(r"^.*(?:error|XCTAssert\w*) failed.*$|^.*: error: .*$", text, re.M)[:15]:
+              print(f"::notice title=Error::{line.strip()[:900]}")
+          PY
+
+      - name: Publish screenshots as check runs
+        if: always() && github.event_name == 'push' && startsWith(github.ref_name, 'claude/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          shopt -s nullglob
+          for f in "$RUNNER_TEMP"/screens/*.png; do
+            name=$(basename "$f" .png)
+            python3 - "$f" "$name" "$RUNNER_TEMP/payload.json" <<'PY' || continue
+          import base64, json, os, subprocess, sys
+
+          src, name, out = sys.argv[1:4]
+          tmp = os.path.join(os.environ["RUNNER_TEMP"], "check-shot.jpg")
+          encoded = None
+          for size, quality in [(1100, 50), (960, 45), (840, 42), (720, 40), (600, 38), (480, 35)]:
+              subprocess.run(["sips", "-Z", str(size), "-s", "format", "jpeg", "-s", "formatOptions",
+                              str(quality), src, "--out", tmp], check=True, capture_output=True)
+              encoded = base64.b64encode(open(tmp, "rb").read()).decode()
+              if len(encoded) <= 64000:
+                  break
+          json.dump({
+              "name": f"Captura del simulador · {name}",
+              "head_sha": os.environ["SHA"],
+              "status": "completed",
+              "conclusion": "neutral",
+              "output": {
+                  "title": f"Captura del simulador: {name}",
+                  "summary": "Pantalla tomada por los tests de interfaz. El texto contiene la imagen JPEG en base64.",
+                  "text": encoded[:65000],
+              },
+          }, open(out, "w"))
+          PY
+            curl -sS -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/check-runs" \
+              --data @"$RUNNER_TEMP/payload.json" -o /dev/null -w "$name: HTTP %{http_code}\n" || true
+          done
