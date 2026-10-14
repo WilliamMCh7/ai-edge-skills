@@ -57,8 +57,9 @@ final class AppTourUITests: XCTestCase {
         urlField.tap()
         urlField.typeText("example.com\n")
 
+        // example.com has changed its wording over time; every version mentions "domain".
         let heading = app.webViews.staticTexts
-            .matching(NSPredicate(format: "label CONTAINS %@", "Example Domain"))
+            .matching(NSPredicate(format: "label CONTAINS[c] %@", "domain"))
             .firstMatch
         guard heading.waitForExistence(timeout: 45) else {
             snapshot("06-web-sin-red")

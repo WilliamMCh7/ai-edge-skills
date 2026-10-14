@@ -84,13 +84,14 @@ struct StitchHomeView: View {
         }
     }
 
-    /// First run / nothing selected: explanation and the three ways to start.
+    /// First run / nothing selected: the three ways to start come right after the hero so they stay
+    /// above the floating tab bar; the explanation follows.
     private var emptyState: some View {
         ScrollView {
             VStack(spacing: 20) {
                 StitchHeroCard()
-                StitchHowToCard()
                 startActions
+                StitchHowToCard()
             }
             .padding(.horizontal, 16)
             .padding(.top, 8)
